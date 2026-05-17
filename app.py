@@ -18,6 +18,7 @@ import tempfile
 import sys
 import platform
 import subprocess
+import gc
 
 # Workaround: some gradio_client.json schemas can be boolean (True/False).
 # Older gradio_client versions assume schema is a dict and try to iterate keys
@@ -314,11 +315,13 @@ def build_device_message_html():
     return "".join(lines)
 
 
-def translate_text(text, source, target):
+def translate_text(text, source, target, translator=None):
     if not text.strip() or target == "none":
         return ""
     try:
-        return GoogleTranslator(source=source, target=target).translate(text) or ""
+        if translator is None:
+            translator = GoogleTranslator(source=source, target=target)
+        return translator.translate(text) or ""
     except Exception as e:
         print(f"[Translation error] {e}", file=sys.stderr)
         return f"[Translation error: {e}]"
@@ -356,7 +359,12 @@ def generate_srt_content(segments):
 
 def generate_subtitle_html(segments, source_lang):
     items_html = []
-    for i, seg in enumerate(segments):
+    # Limit HTML generation to prevent Content-Length overflow with large files
+    MAX_DISPLAY_ITEMS = 150
+    total_items = len(segments)
+    display_items = segments[:MAX_DISPLAY_ITEMS]
+    
+    for i, seg in enumerate(display_items):
         text        = seg["text"]
         translation = seg.get("translation", "")
         romaji      = seg.get("romaji", "")
@@ -391,6 +399,16 @@ def generate_subtitle_html(segments, source_lang):
             )
         item += "</div>"
         items_html.append(item)
+    
+    # Add info about remaining items if there are more than display limit
+    if total_items > MAX_DISPLAY_ITEMS:
+        remaining = total_items - MAX_DISPLAY_ITEMS
+        items_html.append(
+            f'<div style="padding:16px;margin:8px 0;background:#fff3e0;border-radius:8px;'
+            f'border:1px solid #ffe0b2;text-align:center;color:#e65100;font-size:0.9em;">'
+            f'<strong>... dan {remaining} subtitle lainnya</strong><br/>'
+            f'<small>Download file SRT untuk melihat semua subtitle</small></div>'
+        )
 
     segs_data = json.dumps(
         [{"start": s["start"], "end": s["end"]} for s in segments]
@@ -471,14 +489,20 @@ _current_model_size = None
 _whisper_device     = None
 
 
-def process_audio(audio_path, source_lang, target_lang, model_size, progress=gr.Progress()):
+def process_audio(audio_path, source_lang, target_lang, model_size, progress=None):
     global _whisper_model, _current_model_size, _whisper_device
+
+    if progress is None:
+        progress = gr.Progress()
 
     if audio_path is None:
         return (
             "<p style='color:#e53935;padding:20px;'>⚠️ Silahkan upload file audio terlebih dahulu.</p>",
             None,
         )
+    
+    # Ensure initial cleanup
+    gc.collect()
 
     if _whisper_model is None or _current_model_size != model_size:
         # Tentukan apakah GPU (CUDA) tersedia
@@ -560,20 +584,49 @@ def process_audio(audio_path, source_lang, target_lang, model_size, progress=gr.
 
     progress(0.15, desc="Transkripsi audio…")
 
+    audio_size_bytes = None
+    try:
+        audio_size_bytes = os.path.getsize(audio_path)
+    except Exception:
+        pass
+
     lang_code = None if source_lang == "auto" else source_lang
     use_fp16 = (_whisper_device == "cuda")
-    result    = _whisper_model.transcribe(
-        audio_path,
-        language=lang_code,
-        task="transcribe",
-        verbose=False,
-        fp16=use_fp16,
-    )
+    if torch is not None:
+        with torch.no_grad():
+            result = _whisper_model.transcribe(
+                audio_path,
+                language=lang_code,
+                task="transcribe",
+                verbose=False,
+                fp16=use_fp16,
+            )
+    else:
+        result = _whisper_model.transcribe(
+            audio_path,
+            language=lang_code,
+            task="transcribe",
+            verbose=False,
+            fp16=use_fp16,
+        )
+
+    if torch is not None and _whisper_device == "cuda":
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
 
     raw_segs      = result["segments"]
     detected_lang = result.get("language", source_lang)
     if source_lang == "auto":
         source_lang = detected_lang
+
+    translator = None
+    if target_lang != "none":
+        try:
+            translator = GoogleTranslator(source=source_lang, target=target_lang)
+        except Exception:
+            translator = None
 
     processed = []
     n = len(raw_segs)
@@ -595,7 +648,7 @@ def process_audio(audio_path, source_lang, target_lang, model_size, progress=gr.
 
         translation = ""
         if target_lang != "none":
-            translation = translate_text(text, source_lang, target_lang)
+            translation = translate_text(text, source_lang, target_lang, translator=translator)
 
         processed.append({
             "start":        seg["start"],
@@ -608,6 +661,15 @@ def process_audio(audio_path, source_lang, target_lang, model_size, progress=gr.
 
     progress(0.90, desc="Membuat tampilan subtitle…")
     subtitle_html = generate_subtitle_html(processed, source_lang)
+
+    if audio_size_bytes is not None:
+        audio_mb = round(audio_size_bytes / (1024 ** 2), 2)
+        audio_size_html = (
+            f"<div style='font-size:0.9em;color:#666;margin-top:4px;'>" \
+            f"Audio size: {audio_mb} MB ({audio_size_bytes} bytes)</div>"
+        )
+        runtime_device_html = runtime_device_html + audio_size_html
+
     # Gabungkan info device (jika ada) ke tampilan subtitle supaya tidak perlu output terpisah
     try:
         subtitle_html = runtime_device_html + subtitle_html
@@ -616,9 +678,28 @@ def process_audio(audio_path, source_lang, target_lang, model_size, progress=gr.
 
     progress(0.96, desc="Membuat file SRT…")
     srt_content = generate_srt_content(processed)
-    srt_path    = tempfile.mktemp(suffix=".srt")
-    with open(srt_path, "w", encoding="utf-8") as f:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".srt", mode="w", encoding="utf-8") as f:
         f.write(srt_content)
+        srt_path = f.name
+
+    # Thorough cleanup of large temporary objects to reduce memory leak
+    try:
+        del result
+        del raw_segs
+        del srt_content
+        del processed
+        del translator
+        # Keep subtitle_html as it needs to be returned
+    except Exception:
+        pass
+    
+    # Final garbage collection
+    gc.collect()
+    if torch is not None and _whisper_device == "cuda":
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
 
     progress(1.0, desc="Selesai! ✅")
     return subtitle_html, srt_path
@@ -734,6 +815,23 @@ Transkripsi audio otomatis · Furigana Jepang · Terjemahan gratis · Download S
 # ─────────────────────────────────────────────────────────────────────────────
 # ENTRY POINT
 # ─────────────────────────────────────────────────────────────────────────────
+
+# Patch Starlette to handle large responses better
+try:
+    import starlette.responses
+    _orig_response_init = starlette.responses.Response.__init__
+    
+    def _patched_response_init(self, *args, **kwargs):
+        _orig_response_init(self, *args, **kwargs)
+        # For very large responses, don't set Content-Length to avoid overflow
+        if hasattr(self, 'body') and self.body and len(self.body) > 50 * 1024 * 1024:
+            self.headers['Transfer-Encoding'] = 'chunked'
+            if 'Content-Length' in self.headers:
+                del self.headers['Content-Length']
+    
+    starlette.responses.Response.__init__ = _patched_response_init
+except Exception as e:
+    print(f"[Warning] Could not patch Starlette: {e}", file=sys.stderr)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
